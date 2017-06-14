@@ -34,6 +34,14 @@ namespace Shadowsocks.Model
         RuleProxy
     }
 
+    public enum ProxyRuleMode : int
+    {
+        Disable = 0,
+        BypassLan,
+        BypassLanAndChina,
+        BypassLanAndNotChina,
+    }
+
     [Serializable]
     public class PortMapConfig
     {
@@ -67,13 +75,13 @@ namespace Shadowsocks.Model
         public bool random;
         public int sysProxyMode;
         public bool shareOverLan;
-        public bool bypassWhiteList;
         public int localPort;
         public string localAuthPassword;
 
         public string dns_server;
         public int reconnectTimes;
         public int randomAlgorithm;
+        public bool randomInGroup;
         public int TTL;
         public int connect_timeout;
 
@@ -98,15 +106,22 @@ namespace Shadowsocks.Model
 
         public bool isHideTips;
 
+        public string nodeFeedURL;
+        public string nodeFeedGroup;
+        public bool nodeFeedAutoUpdate;
+
         public Dictionary<string, string> token = new Dictionary<string, string>();
         public Dictionary<string, PortMapConfig> portMap = new Dictionary<string, PortMapConfig>();
 
-        private ServerSelectStrategy serverStrategy = new ServerSelectStrategy();
+        private Dictionary<int, ServerSelectStrategy> serverStrategyMap = new Dictionary<int, ServerSelectStrategy>();
         private Dictionary<string, UriVisitTime> uri2time = new Dictionary<string, UriVisitTime>();
         private SortedDictionary<UriVisitTime, string> time2uri = new SortedDictionary<UriVisitTime, string>();
         private Dictionary<int, PortMapConfigCache> portMapCache = new Dictionary<int, PortMapConfigCache>();
 
         private static string CONFIG_FILE = "gui-config.json";
+        private static string DEFAULT_SERVER = "ssr://bm9naWNhdC5uZXQ6NDQzOmF1dGhfYWVzMTI4X21kNTpyYzQtbWQ1LTY6dGxzMS4yX3RpY2tldF9hdXRoOlJHMHRhMWg3SzJ3Lz9vYmZzcGFyYW09Ym05bmFXTmhkQzV1WlhRJnByb3RvcGFyYW09TWpBd01EQXhPaXR0TkRoaU1XdEImcmVtYXJrcz1ibTluYVdOaGRDNXVaWFEmZ3JvdXA9Um5KbFpWTlRVaTF3ZFdKc2FXTQ";
+        private static string DEFAULT_FEED_URL = "https://raw.githubusercontent.com/breakwa11/breakwa11.github.io/master/free/freenodeplain.txt";
+        private static string OLD_DEFAULT_FEED_URL = "https://raw.githubusercontent.com/breakwa11/breakwa11.github.io/master/free/freenode.txt";
 
         public static void SetPassword(string password)
         {
@@ -120,12 +135,16 @@ namespace Shadowsocks.Model
             return true;
         }
 
-        public bool KeepCurrentServer(string targetAddr, string id)
+        public bool KeepCurrentServer(int localPort, string targetAddr, string id)
         {
             if (sameHostForSameTarget && targetAddr != null)
             {
-                lock (serverStrategy)
+                lock (serverStrategyMap)
                 {
+                    if (!serverStrategyMap.ContainsKey(localPort))
+                        serverStrategyMap[localPort] = new ServerSelectStrategy();
+                    ServerSelectStrategy serverStrategy = serverStrategyMap[localPort];
+
                     if (uri2time.ContainsKey(targetAddr))
                     {
                         UriVisitTime visit = uri2time[targetAddr];
@@ -153,10 +172,14 @@ namespace Shadowsocks.Model
             return false;
         }
 
-        public Server GetCurrentServer(string targetAddr = null, bool usingRandom = false, bool forceRandom = false)
+        public Server GetCurrentServer(int localPort, ServerSelectStrategy.FilterFunc filter, string targetAddr = null, bool cfgRandom = false, bool usingRandom = false, bool forceRandom = false)
         {
-            lock (serverStrategy)
+            lock (serverStrategyMap)
             {
+                if (!serverStrategyMap.ContainsKey(localPort))
+                    serverStrategyMap[localPort] = new ServerSelectStrategy();
+                ServerSelectStrategy serverStrategy = serverStrategyMap[localPort];
+
                 foreach (KeyValuePair<UriVisitTime, string> p in time2uri)
                 {
                     if ((DateTime.Now - p.Key.visitTime).TotalSeconds < keepVisitTime)
@@ -181,26 +204,39 @@ namespace Shadowsocks.Model
                 }
                 if (forceRandom)
                 {
-                    int index = serverStrategy.Select(configs, this.index, randomAlgorithm, true);
+                    int index;
+                    if (filter == null && randomInGroup)
+                    {
+                        index = serverStrategy.Select(configs, this.index, randomAlgorithm, delegate (Server server, Server selServer)
+                        {
+                            if (selServer != null)
+                                return selServer.group == server.group;
+                            return false;
+                        } , true);
+                    }
+                    else
+                    {
+                        index = serverStrategy.Select(configs, this.index, randomAlgorithm, filter, true);
+                    }
                     if (index == -1) return GetErrorServer();
-                    //if (targetAddr != null)
-                    //{
-                    //    UriVisitTime visit = new UriVisitTime();
-                    //    visit.uri = targetAddr;
-                    //    visit.index = index;
-                    //    visit.visitTime = DateTime.Now;
-                    //    if (uri2time.ContainsKey(targetAddr))
-                    //    {
-                    //        time2uri.Remove(uri2time[targetAddr]);
-                    //    }
-                    //    uri2time[targetAddr] = visit;
-                    //    time2uri[visit] = targetAddr;
-                    //}
                     return configs[index];
                 }
-                else if (usingRandom && random)
+                else if (usingRandom && cfgRandom)
                 {
-                    int index = serverStrategy.Select(configs, this.index, randomAlgorithm);
+                    int index;
+                    if (filter == null && randomInGroup)
+                    {
+                        index = serverStrategy.Select(configs, this.index, randomAlgorithm, delegate (Server server, Server selServer)
+                        {
+                            if (selServer != null)
+                                return selServer.group == server.group;
+                            return false;
+                        });
+                    }
+                    else
+                    {
+                        index = serverStrategy.Select(configs, this.index, randomAlgorithm, filter);
+                    }
                     if (index == -1) return GetErrorServer();
                     if (targetAddr != null)
                     {
@@ -264,9 +300,14 @@ namespace Shadowsocks.Model
         {
             portMapCache = new Dictionary<int, PortMapConfigCache>();
             Dictionary<string, Server> id2server = new Dictionary<string, Server>();
+            Dictionary<string, int> server_group = new Dictionary<string, int>();
             foreach (Server s in configs)
             {
                 id2server[s.id] = s;
+                if (!string.IsNullOrEmpty(s.group))
+                {
+                    server_group[s.group] = 1;
+                }
             }
             foreach (KeyValuePair<string, PortMapConfig> pair in portMap)
             {
@@ -274,7 +315,9 @@ namespace Shadowsocks.Model
                 PortMapConfig pm = pair.Value;
                 if (!pm.enable)
                     continue;
-                if (!id2server.ContainsKey(pm.id))
+                if (id2server.ContainsKey(pm.id) || server_group.ContainsKey(pm.id) || pm.id == null || pm.id.Length == 0)
+                { }
+                else
                     continue;
                 try
                 {
@@ -288,10 +331,25 @@ namespace Shadowsocks.Model
                 {
                     type = pm.type,
                     id = pm.id,
-                    server = id2server[pm.id],
+                    server = id2server.ContainsKey(pm.id) ? id2server[pm.id] : null,
                     server_addr = pm.server_addr,
                     server_port = pm.server_port
                 };
+            }
+            lock (serverStrategyMap)
+            {
+                List<int> remove_ports = new List<int>();
+                foreach (KeyValuePair<int, ServerSelectStrategy> pair in serverStrategyMap)
+                {
+                    if (portMapCache.ContainsKey(pair.Key)) continue;
+                    remove_ports.Add(pair.Key);
+                }
+                foreach (int port in remove_ports)
+                {
+                    serverStrategyMap.Remove(port);
+                }
+                if (!portMapCache.ContainsKey(localPort))
+                    serverStrategyMap.Remove(localPort);
             }
         }
 
@@ -313,9 +371,21 @@ namespace Shadowsocks.Model
         {
             index = 0;
             localPort = 1080;
+
             reconnectTimes = 2;
             keepVisitTime = 180;
             connect_timeout = 5;
+            dns_server = "";
+
+            randomAlgorithm = (int)ServerSelectStrategy.SelectAlgorithm.LowException;
+            random = true;
+            sysProxyMode = (int)ProxyMode.Global;
+            proxyRuleMode = (int)ProxyRuleMode.BypassLanAndChina;
+
+            nodeFeedURL = DEFAULT_FEED_URL;
+            nodeFeedGroup = "";
+            nodeFeedAutoUpdate = true;
+
             configs = new List<Server>()
             {
                 GetDefaultServer()
@@ -329,10 +399,10 @@ namespace Shadowsocks.Model
             random = config.random;
             sysProxyMode = config.sysProxyMode;
             shareOverLan = config.shareOverLan;
-            bypassWhiteList = config.bypassWhiteList;
             localPort = config.localPort;
             reconnectTimes = config.reconnectTimes;
             randomAlgorithm = config.randomAlgorithm;
+            randomInGroup = config.randomInGroup;
             TTL = config.TTL;
             connect_timeout = config.connect_timeout;
             dns_server = config.dns_server;
@@ -350,6 +420,9 @@ namespace Shadowsocks.Model
             sameHostForSameTarget = config.sameHostForSameTarget;
             keepVisitTime = config.keepVisitTime;
             isHideTips = config.isHideTips;
+            nodeFeedURL = config.nodeFeedURL;
+            nodeFeedGroup = config.nodeFeedGroup;
+            nodeFeedAutoUpdate = config.nodeFeedAutoUpdate;
         }
 
         public void FixConfiguration()
@@ -380,6 +453,10 @@ namespace Shadowsocks.Model
             if (localAuthPassword == null || localAuthPassword.Length < 16)
             {
                 localAuthPassword = randString(20);
+            }
+            if (nodeFeedURL == OLD_DEFAULT_FEED_URL)
+            {
+                nodeFeedURL = DEFAULT_FEED_URL;
             }
 
             Dictionary<string, int> id = new Dictionary<string, int>();
@@ -499,7 +576,7 @@ namespace Shadowsocks.Model
 
         public static Server GetDefaultServer()
         {
-            return new Server();
+            return new Server(DEFAULT_SERVER, null);
         }
 
         public bool isDefaultConfig()
@@ -507,6 +584,18 @@ namespace Shadowsocks.Model
             if (configs.Count == 1 && configs[0].server == Configuration.GetDefaultServer().server)
                 return true;
             return false;
+        }
+
+        public bool isAllFreeNode()
+        {
+            if (String.IsNullOrEmpty(nodeFeedGroup))
+                return false;
+            for (int i = 0; i < configs.Count; ++i)
+            {
+                if (configs[i].group != nodeFeedGroup)
+                    return false;
+            }
+            return true;
         }
 
         public static Server CopyServer(Server server)

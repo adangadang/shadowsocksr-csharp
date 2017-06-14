@@ -21,7 +21,7 @@ namespace Shadowsocks.Controller
 
         public const string Name = "ShadowsocksR";
         public const string Copyright = "Copyright © BreakWa11 2017. Fork from Shadowsocks by clowwindy";
-        public const string Version = "4.0.5";
+        public const string Version = "4.5.0";
 #if !_DOTNET_4_0
         public const string NetVer = "2.0";
 #elif !_CONSOLE
@@ -29,7 +29,16 @@ namespace Shadowsocks.Controller
 #else
         public const string NetVer = "";
 #endif
-        public const string FullVersion = Version + "";
+        public const string FullVersion = Version +
+#if DEBUG
+        " Debug";
+#else
+/*
+        " Alpha";
+/*/
+        "";
+//*/
+#endif
 
         private static bool UseProxy = true;
 
@@ -42,7 +51,7 @@ namespace Shadowsocks.Controller
                 if (UseProxy)
                 {
                     WebProxy proxy = new WebProxy(IPAddress.Loopback.ToString(), config.localPort);
-                    if (config.authPass != null && config.authPass.Length > 0)
+                    if (!string.IsNullOrEmpty(config.authPass))
                     {
                         proxy.Credentials = new NetworkCredential(config.authUser, config.authPass);
                     }
@@ -54,7 +63,7 @@ namespace Shadowsocks.Controller
                 }
                 //UseProxy = !UseProxy;
                 http.DownloadStringCompleted += http_DownloadStringCompleted;
-                http.DownloadStringAsync(new Uri(UpdateURL));
+                http.DownloadStringAsync(new Uri(UpdateURL + "?rnd=" + Util.Utils.RandUInt32().ToString()));
             }
             catch (Exception e)
             {

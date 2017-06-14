@@ -26,6 +26,7 @@ namespace Shadowsocks.Controller
 
         private static FileStream _logFileStream;
         private static StreamWriterWithTimestamp _logStreamWriter;
+        private static object _lock = new object();
 
         public static bool OpenLogFile()
         {
@@ -39,15 +40,16 @@ namespace Shadowsocks.Controller
                 {
                     Directory.CreateDirectory(curpath);
                 }
-                date = DateTime.Now.ToString("yyyy-MM");
-                LogFileName = "shadowsocks_" + date + ".log";
+                string new_date = DateTime.Now.ToString("yyyy-MM");
+                LogFileName = "shadowsocks_" + new_date + ".log";
                 LogFile = Path.Combine(curpath, LogFileName);
                 _logFileStream = new FileStream(LogFile, FileMode.Append);
                 _logStreamWriter = new StreamWriterWithTimestamp(_logFileStream);
                 _logStreamWriter.AutoFlush = true;
                 Console.SetOut(_logStreamWriter);
                 Console.SetError(_logStreamWriter);
-                
+                date = new_date;
+
                 return true;
             }
             catch (IOException e)
@@ -79,13 +81,20 @@ namespace Shadowsocks.Controller
         public static void Error(object o)
         {
             Log(LogLevel.Error, o);
+            System.Diagnostics.Debug.WriteLine($@"[{DateTime.Now}] ERROR {o}");
+        }
+
+        public static void Info(object o)
+        {
+            Log(LogLevel.Info, o);
+            System.Diagnostics.Debug.WriteLine($@"[{DateTime.Now}] INFO  {o}");
         }
 
         [Conditional("DEBUG")]
         public static void Debug(object o)
         {
             Log(LogLevel.Debug, o);
-            System.Diagnostics.Debug.WriteLine($@"[{DateTime.Now}] {o}");
+            System.Diagnostics.Debug.WriteLine($@"[{DateTime.Now}] DEBUG {o}");
         }
 
         private static string ToString(StackFrame[] stacks)
@@ -98,12 +107,23 @@ namespace Shadowsocks.Controller
             return result;
         }
 
-        public static void LogUsefulException(Exception e)
+        protected static void UpdateLogFile()
         {
             if (DateTime.Now.ToString("yyyy-MM") != date)
             {
-                OpenLogFile();
+                lock (_lock)
+                {
+                    if (DateTime.Now.ToString("yyyy-MM") != date)
+                    {
+                        OpenLogFile();
+                    }
+                }
             }
+        }
+
+        public static void LogUsefulException(Exception e)
+        {
+            UpdateLogFile();
             // just log useful exceptions, not all of them
             if (e is SocketException)
             {
@@ -129,6 +149,10 @@ namespace Shadowsocks.Controller
                 {
                     // ignore
                 }
+                else if (se.SocketErrorCode == SocketError.Interrupted)
+                {
+                    // ignore
+                }
                 else
                 {
                     Error(e);
@@ -146,10 +170,7 @@ namespace Shadowsocks.Controller
 
         public static bool LogSocketException(string remarks, string server, Exception e)
         {
-            if (DateTime.Now.ToString("yyyy-MM") != date)
-            {
-                OpenLogFile();
-            }
+            UpdateLogFile();
             // just log useful exceptions, not all of them
             if (e is ObfsException)
             {
@@ -170,20 +191,7 @@ namespace Shadowsocks.Controller
             else if (e is SocketException)
             {
                 SocketException se = (SocketException)e;
-                if (se.SocketErrorCode == SocketError.ConnectionAborted)
-                {
-                    // closed by browser when sending
-                    // normally happens when download is canceled or a tab is closed before page is loaded
-                }
-                else if (se.SocketErrorCode == SocketError.ConnectionReset)
-                {
-                    // received rst
-                }
-                else if (se.SocketErrorCode == SocketError.NotConnected)
-                {
-                    // close when not connected
-                }
-                else if ((uint)se.SocketErrorCode == 0x80004005)
+                if ((uint)se.SocketErrorCode == 0x80004005)
                 {
                     // already closed
                     return true;
@@ -236,6 +244,7 @@ namespace Shadowsocks.Controller
         }
         public static void Log(LogLevel level, object s)
         {
+            UpdateLogFile();
             var strMap = new []{
                 "Debug",
                 "Info",

@@ -42,6 +42,19 @@ namespace Shadowsocks.Util
             // which is part of user experience
             GC.Collect(GC.MaxGeneration);
             GC.WaitForPendingFinalizers();
+
+            if (UIntPtr.Size == 4)
+            {
+                SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle,
+                                         (UIntPtr)0xFFFFFFFF,
+                                         (UIntPtr)0xFFFFFFFF);
+            }
+            else if (UIntPtr.Size == 8)
+            {
+                SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle,
+                                         (UIntPtr)0xFFFFFFFFFFFFFFFF,
+                                         (UIntPtr)0xFFFFFFFFFFFFFFFF);
+            }
 #endif
         }
 
@@ -69,6 +82,37 @@ namespace Shadowsocks.Util
             RNGCryptoServiceProvider rngServiceProvider = new RNGCryptoServiceProvider();
             rngServiceProvider.GetBytes(temp);
             temp.CopyTo(buf, 0);
+        }
+
+        public static UInt32 RandUInt32()
+        {
+            byte[] temp = new byte[4];
+            RNGCryptoServiceProvider rngServiceProvider = new RNGCryptoServiceProvider();
+            rngServiceProvider.GetBytes(temp);
+            return BitConverter.ToUInt32(temp, 0);
+        }
+
+        public static void Shuffle<T>(IList<T> list, Random rng)
+        {
+            int n = list.Count;
+            while (n > 1)
+            {
+                int k = rng.Next(n);
+                n--;
+                T value = list[k];
+                list[k] = list[n];
+                list[n] = value;
+            }
+        }
+
+        public static bool BitCompare(byte[] target, int target_offset, byte[] m, int m_offset, int targetLength)
+        {
+            for (int i = 0; i < targetLength; ++i)
+            {
+                if (target[target_offset + i] != m[m_offset + i])
+                    return false;
+            }
+            return true;
         }
 
         public static int FindStr(byte[] target, int targetLength, byte[] m)
@@ -174,6 +218,8 @@ namespace Shadowsocks.Util
             byte[] addr = ip.GetAddressBytes();
             if (addr.Length == 4)
             {
+                if (ip.Equals(new IPAddress(0)))
+                    return false;
                 string[] netmasks = new string[]
                 {
                     "0.0.0.0/8",
@@ -272,21 +318,74 @@ namespace Shadowsocks.Util
 
         public static IPAddress QueryDns(string host, string dns_servers, bool IPv6_first = false)
         {
-            IPAddress ipAddress = null;
+            IPAddress ret_ipAddress = null;
             {
-                if (dns_servers != null && dns_servers.Length > 0)
+                if (!string.IsNullOrEmpty(dns_servers))
                 {
                     OpenDNS.Types[] types;
                     if (IPv6_first)
                         types = new Types[] { Types.AAAA, Types.A };
                     else
                         types = new Types[] { Types.A, Types.AAAA };
-                    string[] dns_server = dns_servers.Split(',');
+                    string[] _dns_server = dns_servers.Split(',');
+                    List<IPEndPoint> dns_server = new List<IPEndPoint>();
+                    List<IPEndPoint> local_dns_server = new List<IPEndPoint>();
+                    foreach (string server_str in _dns_server)
+                    {
+                        IPAddress ipAddress = null;
+                        string server = server_str.Trim(' ');
+                        int index = server.IndexOf(':');
+                        string ip = null;
+                        string port = null;
+                        if (index >= 0)
+                        {
+                            if (server.StartsWith("["))
+                            {
+                                int ipv6_end = server.IndexOf(']', 1);
+                                if (ipv6_end >= 0)
+                                {
+                                    ip = server.Substring(1, ipv6_end - 1);
+
+                                    index = server.IndexOf(':', ipv6_end);
+                                    if (index == ipv6_end + 1)
+                                    {
+                                        port = server.Substring(index + 1);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                ip = server.Substring(0, index);
+                                port = server.Substring(index + 1);
+                            }
+                        }
+                        else
+                        {
+                            index = server.IndexOf(' ');
+                            if (index >= 0)
+                            {
+                                ip = server.Substring(0, index);
+                                port = server.Substring(index + 1);
+                            }
+                            else
+                            {
+                                ip = server;
+                            }
+                        }
+                        if (ip != null && IPAddress.TryParse(ip, out ipAddress))
+                        {
+                            int i_port = 53;
+                            if (port != null)
+                                int.TryParse(port, out i_port);
+                            dns_server.Add(new IPEndPoint(ipAddress, i_port));
+                            //dns_server.Add(port == null ? ip : ip + " " + port);
+                        }
+                    }
                     for (int query_i = 0; query_i < types.Length; ++query_i)
                     {
                         DnsQuery dns = new DnsQuery(host, types[query_i]);
                         dns.RecursionDesired = true;
-                        foreach (string server in dns_server)
+                        foreach (IPEndPoint server in dns_server)
                         {
                             dns.Servers.Add(server);
                         }
@@ -310,15 +409,16 @@ namespace Shadowsocks.Util
                     {
                         GetHostEntryHandler callback = new GetHostEntryHandler(Dns.GetHostEntry);
                         IAsyncResult result = callback.BeginInvoke(host, null, null);
-                        if (result.AsyncWaitHandle.WaitOne(5, true))
+                        if (result.AsyncWaitHandle.WaitOne(10000, true))
                         {
                             foreach (IPAddress ad in callback.EndInvoke(result).AddressList)
                             {
+                                if (ad.AddressFamily == AddressFamily.InterNetwork)
+                                    return ad;
+                            }
+                            foreach (IPAddress ad in callback.EndInvoke(result).AddressList)
+                            {
                                 return ad;
-                                //if (ad.AddressFamily == AddressFamily.InterNetwork)
-                                //{
-                                //    return ad;
-                                //}
                             }
                         }
                     }
@@ -328,12 +428,36 @@ namespace Shadowsocks.Util
                     }
                 }
             }
-            return ipAddress;
+            return ret_ipAddress;
         }
 
         public static string GetExecutablePath()
         {
             return System.Reflection.Assembly.GetExecutingAssembly().Location;
+        }
+
+        public static int RunAsAdmin(string Arguments)
+        {
+            Process process = null;
+            ProcessStartInfo processInfo = new ProcessStartInfo();
+            processInfo.Verb = "runas";
+            processInfo.FileName = Application.ExecutablePath;
+            processInfo.Arguments = Arguments;
+            try
+            {
+                process = Process.Start(processInfo);
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return -1;
+            }
+            if (process != null)
+            {
+                process.WaitForExit();
+            }
+            int ret = process.ExitCode;
+            process.Close();
+            return ret;
         }
 
         public static int GetDpiMul()
@@ -363,6 +487,11 @@ namespace Shadowsocks.Util
 
         [DllImport("gdi32.dll")]
         static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
+
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetProcessWorkingSetSize(IntPtr process,
+            UIntPtr minimumWorkingSetSize, UIntPtr maximumWorkingSetSize);
 #endif
     }
 }

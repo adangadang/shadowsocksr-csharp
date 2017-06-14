@@ -24,17 +24,36 @@ namespace Shadowsocks.View
             this.controller = controller;
             controller.ConfigChanged += controller_ConfigChanged;
 
+            UpdateTexts();
+
             comboBoxType.DisplayMember = "Text";
             comboBoxType.ValueMember = "Value";
             var items = new[]
             {
-                new {Text = "Port Forward", Value = PortMapType.Forward},
-                new {Text = "Force Proxy", Value = PortMapType.ForceProxy},
-                new {Text = "Proxy With Rule", Value = PortMapType.RuleProxy}
+                new {Text = I18N.GetString("Port Forward"), Value = PortMapType.Forward},
+                new {Text = I18N.GetString("Force Proxy"), Value = PortMapType.ForceProxy},
+                new {Text = I18N.GetString("Proxy With Rule"), Value = PortMapType.RuleProxy}
             };
             comboBoxType.DataSource = items;
 
             LoadCurrentConfiguration();
+        }
+
+        private void UpdateTexts()
+        {
+            this.Text = I18N.GetString("Port Settings");
+            groupBox1.Text = I18N.GetString("Map Setting");
+            labelType.Text = I18N.GetString("Type");
+            labelID.Text = I18N.GetString("Server ID");
+            labelAddr.Text = I18N.GetString("Target Addr");
+            labelPort.Text = I18N.GetString("Target Port");
+            checkEnable.Text = I18N.GetString("Enable");
+            labelLocal.Text = I18N.GetString("Local Port");
+            label1.Text = I18N.GetString("Remarks");
+            OKButton.Text = I18N.GetString("OK");
+            MyCancelButton.Text = I18N.GetString("Cancel");
+            Add.Text = I18N.GetString("&Add");
+            Del.Text = I18N.GetString("&Delete");
         }
 
         private void controller_ConfigChanged(object sender, EventArgs e)
@@ -70,7 +89,16 @@ namespace Shadowsocks.View
         {
             comboServers.Items.Clear();
             comboServers.Items.Add("");
-            foreach(Server s in configuration.configs)
+            Dictionary<string, int> server_group = new Dictionary<string, int>();
+            foreach (Server s in configuration.configs)
+            {
+                if (!string.IsNullOrEmpty(s.group) && !server_group.ContainsKey(s.group))
+                {
+                    comboServers.Items.Add("#" + s.group);
+                    server_group[s.group] = 1;
+                }
+            }
+            foreach (Server s in configuration.configs)
             {
                 comboServers.Items.Add(GetDisplayText(s));
             }
@@ -120,14 +148,14 @@ namespace Shadowsocks.View
             {
                 bool reflash_list = false;
                 string key = _oldSelectedIndex.ToString();
-                if (key != textLocal.Text)
+                if (key != NumLocalPort.Text)
                 {
                     if (_modifiedConfiguration.portMap.ContainsKey(key))
                     {
                         _modifiedConfiguration.portMap.Remove(key);
                     }
                     reflash_list = true;
-                    key = textLocal.Text;
+                    key = NumLocalPort.Text;
                     try
                     {
                         _oldSelectedIndex = int.Parse(key);
@@ -152,14 +180,7 @@ namespace Shadowsocks.View
                     reflash_list = true;
                 }
                 cfg.remarks = textRemarks.Text;
-                try
-                {
-                    cfg.server_port = int.Parse(textPort.Text);
-                }
-                catch(FormatException)
-                {
-                    cfg.server_port = 0;
-                }
+                cfg.server_port = Convert.ToInt32(NumTargetPort.Value);
                 if (reflash_list)
                 {
                     LoadConfiguration(_modifiedConfiguration);
@@ -170,16 +191,29 @@ namespace Shadowsocks.View
         private void LoadSelectedServer()
         {
             string key = ServerListText2Key((string)listPorts.SelectedItem);
+            Dictionary<string, int> server_group = new Dictionary<string, int>();
+            foreach (Server s in _modifiedConfiguration.configs)
+            {
+                if (!string.IsNullOrEmpty(s.group) && !server_group.ContainsKey(s.group))
+                {
+                    server_group[s.group] = 1;
+                }
+            }
             if (key != null && _modifiedConfiguration.portMap.ContainsKey(key))
             {
                 PortMapConfig cfg = _modifiedConfiguration.portMap[key] as PortMapConfig;
 
                 checkEnable.Checked = cfg.enable;
                 comboBoxType.SelectedValue = cfg.type;
-                comboServers.Text = GetIDText(cfg.id);
-                textLocal.Text = key;
+                string text = GetIDText(cfg.id);
+                if (text.Length == 0 && server_group.ContainsKey(cfg.id))
+                {
+                    text = "#" + cfg.id;
+                }
+                comboServers.Text = text;
+                NumLocalPort.Text = key;
                 textAddr.Text = cfg.server_addr;
-                textPort.Text = cfg.server_port.ToString();
+                NumTargetPort.Value = cfg.server_port;
                 textRemarks.Text = cfg.remarks ?? "";
 
                 try
@@ -204,7 +238,7 @@ namespace Shadowsocks.View
 
         private string GetDisplayText(Server s)
         {
-            return (s.group != null && s.group.Length > 0 ? s.group + " - " : "    - ") + s.FriendlyName() + "        #" + s.id;
+            return (!string.IsNullOrEmpty(s.group) ? s.group + " - " : "    - ") + s.FriendlyName() + "        #" + s.id;
         }
 
         private string GetIDText(string id)
@@ -227,6 +261,7 @@ namespace Shadowsocks.View
 
         private void Add_Click(object sender, EventArgs e)
         {
+            SaveSelectedServer();
             string key = "0";
             if (!_modifiedConfiguration.portMap.ContainsKey(key))
             {
@@ -239,14 +274,7 @@ namespace Shadowsocks.View
             cfg.id = GetID(comboServers.Text);
             cfg.server_addr = textAddr.Text;
             cfg.remarks = textRemarks.Text;
-            try
-            {
-                cfg.server_port = int.Parse(textPort.Text);
-            }
-            catch (FormatException)
-            {
-                cfg.server_port = 0;
-            }
+            cfg.server_port = Convert.ToInt32(NumTargetPort.Value);
 
             _oldSelectedIndex = -1;
             LoadConfiguration(_modifiedConfiguration);
@@ -270,12 +298,14 @@ namespace Shadowsocks.View
             if (comboBoxType.SelectedIndex == 0)
             {
                 textAddr.ReadOnly = false;
-                textPort.ReadOnly = false;
+                NumTargetPort.ReadOnly = false;
+                NumTargetPort.Increment = 1;
             }
             else
             {
                 textAddr.ReadOnly = true;
-                textPort.ReadOnly = true;
+                NumTargetPort.ReadOnly = true;
+                NumTargetPort.Increment = 0;
             }
         }
     }

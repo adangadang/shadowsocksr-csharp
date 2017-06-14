@@ -12,6 +12,7 @@ namespace Shadowsocks.Controller
     public enum ProxyMode
     {
         NoModify,
+        Direct,
         Pac,
         Global,
     }
@@ -23,8 +24,6 @@ namespace Shadowsocks.Controller
         // manipulates UI
         // interacts with low level logic
 
-        private Thread _ramThread;
-
         private Listener _listener;
         private List<Listener> _port_map_listener;
         private PACServer _pacServer;
@@ -33,7 +32,6 @@ namespace Shadowsocks.Controller
         public IPRangeSet _rangeSet;
 #if !_CONSOLE
         private HttpProxyRunner polipoRunner;
-        private bool _systemProxyIsDirty = false;
 #endif
         private GFWListUpdater gfwListUpdater;
         private bool stopped = false;
@@ -92,16 +90,11 @@ namespace Shadowsocks.Controller
         public void ReloadIPRange()
         {
             _rangeSet = new IPRangeSet();
-            _rangeSet.LoadApnic("CN");
-            if (_config.proxyRuleMode == 3)
+            _rangeSet.LoadChn();
+            if (_config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndNotChina)
             {
                 _rangeSet.Reverse();
             }
-        }
-
-        public Server GetCurrentServer()
-        {
-            return _config.GetCurrentServer();
         }
 
         // always return copy
@@ -119,17 +112,7 @@ namespace Shadowsocks.Controller
         {
             for (int i = 0; i < servers.Count; ++i)
             {
-                if (servers[i].server == server.server
-                    && servers[i].server_port == server.server_port
-                    && servers[i].server_udp_port == server.server_udp_port
-                    && servers[i].method == server.method
-                    && servers[i].protocol == server.protocol
-                    && servers[i].protocolparam == server.protocolparam
-                    && servers[i].obfs == server.obfs
-                    && servers[i].obfsparam == server.obfsparam
-                    && servers[i].password == server.password
-                    && servers[i].udp_over_tcp == server.udp_over_tcp
-                    )
+                if (server.isMatchServer(servers[i]))
                 {
                     return i;
                 }
@@ -161,7 +144,9 @@ namespace Shadowsocks.Controller
                     int i = FindFirstMatchServer(servers[j], mergeConfig.configs);
                     if (i != -1)
                     {
+                        bool enable = servers[j].enable;
                         servers[j].CopyServer(mergeConfig.configs[i]);
+                        servers[j].enable = enable;
                     }
                 }
             }
@@ -221,17 +206,24 @@ namespace Shadowsocks.Controller
             _config.FlushPortMapCache();
         }
 
-        public bool AddServerBySSURL(string ssURL)
+        public bool AddServerBySSURL(string ssURL, string force_group = null, bool toLast = false)
         {
             if (ssURL.StartsWith("ss://", StringComparison.OrdinalIgnoreCase) || ssURL.StartsWith("ssr://", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
-                    var server = new Server(ssURL);
-                    int index = _config.index + 1;
-                    if (index < 0 || index > _config.configs.Count)
-                        index = _config.configs.Count;
-                    _config.configs.Insert(index, server);
+                    var server = new Server(ssURL, force_group);
+                    if (toLast)
+                    {
+                        _config.configs.Add(server);
+                    }
+                    else
+                    {
+                        int index = _config.index + 1;
+                        if (index < 0 || index > _config.configs.Count)
+                            index = _config.configs.Count;
+                        _config.configs.Insert(index, server);
+                    }
                     SaveConfig(_config);
                     return true;
                 }
@@ -247,9 +239,9 @@ namespace Shadowsocks.Controller
             }
         }
 
-        public void ToggleMode(int mode)
+        public void ToggleMode(ProxyMode mode)
         {
-            _config.sysProxyMode = mode;
+            _config.sysProxyMode = (int)mode;
             SaveConfig(_config);
             if (ToggleModeChanged != null)
             {
@@ -265,12 +257,6 @@ namespace Shadowsocks.Controller
             {
                 ToggleRuleModeChanged(this, new EventArgs());
             }
-        }
-
-        public void ToggleBypass(bool bypass)
-        {
-            _config.bypassWhiteList = bypass;
-            SaveConfig(_config);
         }
 
         public void ToggleSelectRandom(bool enabled)
@@ -316,7 +302,7 @@ namespace Shadowsocks.Controller
             {
                 polipoRunner.Stop();
             }
-            if (_config.sysProxyMode != (int)ProxyMode.NoModify)
+            if (_config.sysProxyMode != (int)ProxyMode.NoModify && _config.sysProxyMode != (int)ProxyMode.Direct)
             {
                 SystemProxy.Update(_config, true);
             }
@@ -373,14 +359,6 @@ namespace Shadowsocks.Controller
             }
         }
 
-        public void UpdateBypassListFromDefault()
-        {
-            if (gfwListUpdater != null)
-            {
-                gfwListUpdater.UpdateBypassListFromDefault(_config);
-            }
-        }
-
         protected void Reload()
         {
             if (_port_map_listener != null)
@@ -395,6 +373,10 @@ namespace Shadowsocks.Controller
             _config = MergeGetConfiguration(_config);
             _config.FlushPortMapCache();
             ReloadIPRange();
+
+            HostMap hostMap = new HostMap();
+            hostMap.LoadHostFile();
+            HostMap.Instance().Clear(hostMap);
 
 #if !_CONSOLE
             if (polipoRunner == null)
@@ -544,16 +526,6 @@ namespace Shadowsocks.Controller
             if (_config.sysProxyMode != (int)ProxyMode.NoModify)
             {
                 SystemProxy.Update(_config, false);
-                _systemProxyIsDirty = true;
-            }
-            else
-            {
-                // only switch it off if we have switched it on
-                if (_systemProxyIsDirty)
-                {
-                    SystemProxy.Update(_config, false);
-                    _systemProxyIsDirty = false;
-                }
             }
 #endif
         }
@@ -573,22 +545,6 @@ namespace Shadowsocks.Controller
         {
             if (UpdatePACFromGFWListError != null)
                 UpdatePACFromGFWListError(sender, e);
-        }
-
-        private void StartReleasingMemory()
-        {
-            _ramThread = new Thread(new ThreadStart(ReleaseMemory));
-            _ramThread.IsBackground = true;
-            _ramThread.Start();
-        }
-
-        private void ReleaseMemory()
-        {
-            while (true)
-            {
-                Util.Utils.ReleaseMemory();
-                Thread.Sleep(30 * 1000);
-            }
         }
 
         public void ShowConfigForm(int index)

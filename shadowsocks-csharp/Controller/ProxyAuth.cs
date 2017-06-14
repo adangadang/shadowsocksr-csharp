@@ -51,7 +51,7 @@ namespace Shadowsocks.Controller
             _firstPacket = firstPacket;
             _firstPacketLength = length;
             _connection = socket;
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+            socket.NoDelay = true;
 
             if (_config.GetPortMapCache().ContainsKey(local_port) && _config.GetPortMapCache()[local_port].type == PortMapType.Forward)
             {
@@ -105,6 +105,10 @@ namespace Shadowsocks.Controller
             {
                 return true;
             }
+            if (Util.Utils.isMatchSubNet(((IPEndPoint)_connection.RemoteEndPoint).Address, "127.0.0.0/8"))
+            {
+                return true;
+            }
             return false;
         }
 
@@ -116,12 +120,12 @@ namespace Shadowsocks.Controller
 
                 if (bytesRead > 1)
                 {
-                    if ((!(_config.authUser != null && _config.authUser.Length > 0) || Util.Utils.isMatchSubNet(((IPEndPoint)_connection.RemoteEndPoint).Address, "127.0.0.0/8"))
+                    if ((!string.IsNullOrEmpty(_config.authUser) || Util.Utils.isMatchSubNet(((IPEndPoint)_connection.RemoteEndPoint).Address, "127.0.0.0/8"))
                         && _firstPacket[0] == 4 && _firstPacketLength >= 9)
                     {
                         RspSocks4aHandshakeReceive();
                     }
-                    else if (_firstPacket[0] == 5 && _firstPacketLength >= 2)
+                    else if (_firstPacket[0] == 5 && _firstPacketLength >= 3)
                     {
                         RspSocks5HandshakeReceive();
                     }
@@ -193,17 +197,48 @@ namespace Shadowsocks.Controller
             {
                 response = new byte[] { 0, 91 };
                 Console.WriteLine("socks 4/5 protocol error");
+                _connection.Send(response);
+                Close();
+                return;
             }
-            if ((_config.authUser != null && _config.authUser.Length > 0) && !Util.Utils.isMatchSubNet(((IPEndPoint)_connection.RemoteEndPoint).Address, "127.0.0.0/8"))
+            bool no_auth = false;
+            bool auth = false;
+            bool has_method = false;
+            for (int index = 0; index < _firstPacket[1]; ++index)
+            {
+                if (_firstPacket[2 + index] == 0)
+                {
+                    no_auth = true;
+                    has_method = true;
+                }
+                else if (_firstPacket[2 + index] == 2)
+                {
+                    auth = true;
+                    has_method = true;
+                }
+            }
+            if (!has_method)
+            {
+                Console.WriteLine("Socks5 no acceptable auth method");
+                Close();
+                return;
+            }
+            if (auth || !no_auth)
             {
                 response[1] = 2;
                 _connection.Send(response);
                 HandshakeAuthReceiveCallback();
             }
-            else
+            else if (no_auth && (string.IsNullOrEmpty(_config.authUser)
+                || Util.Utils.isMatchSubNet(((IPEndPoint)_connection.RemoteEndPoint).Address, "127.0.0.0/8")))
             {
                 _connection.Send(response);
                 HandshakeReceive2Callback();
+            }
+            else
+            {
+                Console.WriteLine("Socks5 Auth failed");
+                Close();
             }
         }
 
@@ -485,14 +520,18 @@ namespace Shadowsocks.Controller
 
         private void Connect()
         {
+            Handler.GetCurrentServer getCurrentServer = delegate (int localPort, ServerSelectStrategy.FilterFunc filter, string targetURI, bool cfgRandom, bool usingRandom, bool forceRandom) { return _config.GetCurrentServer(localPort, filter, targetURI, cfgRandom, usingRandom, forceRandom); };
+            Handler.KeepCurrentServer keepCurrentServer = delegate (int localPort, string targetURI, string id) { _config.KeepCurrentServer(localPort, targetURI, id); };
+
             int local_port = ((IPEndPoint)_connection.LocalEndPoint).Port;
             Handler handler = new Handler();
 
-            handler.getCurrentServer = delegate (string targetURI, bool usingRandom, bool forceRandom) { return _config.GetCurrentServer(targetURI, usingRandom, forceRandom); };
-            handler.keepCurrentServer = delegate (string targetURI, string id) { _config.KeepCurrentServer(targetURI, id); };
+            handler.getCurrentServer = getCurrentServer;
+            handler.keepCurrentServer = keepCurrentServer;
             handler.connection = new ProxySocketTunLocal(_connection);
             handler.connectionUDP = _connectionUDP;
             handler.cfg.reconnectTimesRemain = _config.reconnectTimes;
+            handler.cfg.random = _config.random;
             handler.cfg.forceRandom = _config.random;
             handler.setServerTransferTotal(_transfer);
             if (_config.proxyEnable)
@@ -507,16 +546,23 @@ namespace Shadowsocks.Controller
             handler.cfg.TTL = _config.TTL;
             handler.cfg.connect_timeout = _config.connect_timeout;
             handler.cfg.autoSwitchOff = _config.autoBan;
-            if (_config.dns_server != null && _config.dns_server.Length > 0)
+            if (!string.IsNullOrEmpty(_config.dns_server))
             {
                 handler.cfg.dns_servers = _config.dns_server;
             }
             if (_config.GetPortMapCache().ContainsKey(local_port))
             {
                 PortMapConfigCache cfg = _config.GetPortMapCache()[local_port];
-                if (cfg.id == cfg.server.id)
+                if (cfg.server == null || cfg.id == cfg.server.id)
                 {
-                    handler.select_server = cfg.server;
+                    if (cfg.server != null)
+                    {
+                        handler.select_server = delegate (Server server, Server selServer) { return server.id == cfg.server.id; };
+                    }
+                    else if (!string.IsNullOrEmpty(cfg.id))
+                    {
+                        handler.select_server = delegate (Server server, Server selServer) { return server.group == cfg.id; };
+                    }
                     if (cfg.type == PortMapType.Forward) // tunnel
                     {
                         byte[] addr = System.Text.Encoding.UTF8.GetBytes(cfg.server_addr);
@@ -530,7 +576,8 @@ namespace Shadowsocks.Controller
                         _remoteHeaderSendBuffer = newFirstPacket;
                         handler.Start(_remoteHeaderSendBuffer, _remoteHeaderSendBuffer.Length, null);
                     }
-                    else if (_connectionUDP == null && cfg.type == PortMapType.RuleProxy && new Socks5Forwarder(_config, _IPRange).Handle(_remoteHeaderSendBuffer, _remoteHeaderSendBuffer.Length, _connection))
+                    else if (_connectionUDP == null && cfg.type == PortMapType.RuleProxy
+                        && (new Socks5Forwarder(_config, _IPRange)).Handle(_remoteHeaderSendBuffer, _remoteHeaderSendBuffer.Length, _connection, local_sendback_protocol))
                     {
                     }
                     else

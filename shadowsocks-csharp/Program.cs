@@ -28,6 +28,17 @@ namespace Shadowsocks
         static void Main(string[] args)
         {
 #if !_CONSOLE
+            foreach (string arg in args)
+            {
+                if (arg == "--setautorun")
+                {
+                    if (!Controller.AutoStartup.Switch())
+                    {
+                        Environment.ExitCode = 1;
+                    }
+                    return;
+                }
+            }
             using (Mutex mutex = new Mutex(false, "Global\\ShadowsocksR_" + Application.StartupPath.GetHashCode()))
             {
                 AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
@@ -55,8 +66,10 @@ namespace Shadowsocks
                     if (try_times >= 5)
                         return;
                     InputPassword dlg = new InputPassword();
-                    dlg.ShowDialog();
-                    Configuration.SetPassword(dlg.password);
+                    if (dlg.ShowDialog() == DialogResult.OK)
+                        Configuration.SetPassword(dlg.password);
+                    else
+                        return;
                     try_times += 1;
                 }
 #endif

@@ -268,6 +268,7 @@ namespace Shadowsocks.Obfs
     public class TlsAuthData
     {
         public byte[] clientID;
+        public Dictionary<string, byte[]> ticket_buf;
     }
 
     class TlsTicketAuthObfs : ObfsBase
@@ -276,18 +277,23 @@ namespace Shadowsocks.Obfs
             : base(method)
         {
             handshake_status = 0;
+            if (method == "tls1.2_ticket_fastauth")
+                fastauth = true;
         }
         private static Dictionary<string, int[]> _obfs = new Dictionary<string, int[]> {
                 {"tls1.2_ticket_auth", new int[]  {0, 1, 1}},
+                {"tls1.2_ticket_fastauth", new int[]  {0, 1, 1}},
         };
 
         private int handshake_status;
         private List<byte[]> data_sent_buffer = new List<byte[]>();
         private byte[] data_recv_buffer = new byte[0];
         private uint send_id = 0;
+        private bool fastauth = false;
 
         protected static RNGCryptoServiceProvider g_random = new RNGCryptoServiceProvider();
-        private Random random = new Random();
+        protected Random random = new Random();
+        protected const int overhead = 5;
 
         public static List<string> SupportedObfs()
         {
@@ -307,6 +313,11 @@ namespace Shadowsocks.Obfs
         public override bool isAlwaysSendback()
         {
             return true;
+        }
+
+        public override int GetOverhead()
+        {
+            return overhead;
         }
 
         protected byte[] sni(string url)
@@ -412,7 +423,7 @@ namespace Shadowsocks.Obfs
                 return encryptdata;
             }
             byte[] outdata = new byte[datalength + 4096];
-            if (handshake_status == 8)
+            if ((handshake_status & 4) == 4)
             {
                 int start = 0;
                 outlength = 0;
@@ -432,37 +443,43 @@ namespace Shadowsocks.Obfs
                 {
                     PackData(encryptdata, ref start, datalength - start, outdata, ref outlength);
                 }
+                return outdata;
             }
-            else if (handshake_status == 1)
+            if (datalength > 0)
+            {
+                byte[] data = new byte[datalength + 5];
+                data[0] = 0x17;
+                data[1] = 0x3;
+                data[2] = 0x3;
+                data[3] = (byte)(datalength >> 8);
+                data[4] = (byte)(datalength);
+                Array.Copy(encryptdata, 0, data, 5, datalength);
+                data_sent_buffer.Add(data);
+            }
+            if ((handshake_status & 3) != 0)
             {
                 outlength = 0;
-                if (datalength > 0)
+                if ((handshake_status & 2) == 0)
                 {
-                    byte[] data = new byte[datalength + 5];
-                    data[0] = 0x17;
-                    data[1] = 0x3;
-                    data[2] = 0x3;
-                    data[3] = (byte)(datalength >> 8);
-                    data[4] = (byte)(datalength);
-                    Array.Copy(encryptdata, 0, data, 5, datalength);
-                    data_sent_buffer.Add(data);
+                    int[] finish_len_set = new int[] { 32 }; //, 40, 64
+                    int finish_len = finish_len_set[random.Next(finish_len_set.Length)];
+                    byte[] hmac_data = new byte[11 + finish_len];
+                    byte[] rnd = new byte[finish_len - 10];
+                    random.NextBytes(rnd);
+
+                    byte[] handshake_finish = System.Text.Encoding.ASCII.GetBytes("\x14\x03\x03\x00\x01\x01" + "\x16\x03\x03\x00\x20");
+                    handshake_finish[handshake_finish.Length - 1] = (byte)finish_len;
+                    handshake_finish.CopyTo(hmac_data, 0);
+                    rnd.CopyTo(hmac_data, handshake_finish.Length);
+
+                    hmac_sha1(hmac_data, hmac_data.Length);
+
+                    data_sent_buffer.Insert(0, hmac_data);
+                    SentLength -= hmac_data.Length;
+                    handshake_status |= 2;
                 }
-                else
+                if (datalength == 0 || fastauth)
                 {
-                    {
-                        byte[] hmac_data = new byte[43];
-                        byte[] rnd = new byte[22];
-                        random.NextBytes(rnd);
-
-                        byte[] handshake_finish = System.Text.Encoding.ASCII.GetBytes("\x14\x03\x03\x00\x01\x01" + "\x16\x03\x03\x00\x20");
-                        handshake_finish.CopyTo(hmac_data, 0);
-                        rnd.CopyTo(hmac_data, handshake_finish.Length);
-
-                        hmac_sha1(hmac_data, hmac_data.Length);
-
-                        data_sent_buffer.Insert(0, hmac_data);
-                        SentLength -= hmac_data.Length;
-                    }
                     foreach (byte[] data in data_sent_buffer)
                     {
                         Util.Utils.SetArrayMinSize2(ref outdata, outlength + data.Length);
@@ -471,7 +488,10 @@ namespace Shadowsocks.Obfs
                         outlength += data.Length;
                     }
                     data_sent_buffer.Clear();
-                    handshake_status = 8;
+                }
+                if (datalength == 0)
+                {
+                    handshake_status |= 4;
                 }
             }
             else
@@ -498,16 +518,38 @@ namespace Shadowsocks.Obfs
                         host = host.Trim(' ');
                     }
                 }
-                if (host != null && host.Length > 0 && host[host.Length - 1] >= '0' && host[host.Length - 1] <= '9' && Server.param.Length == 0)
+                if (!string.IsNullOrEmpty(host) && host[host.Length - 1] >= '0' && host[host.Length - 1] <= '9' && Server.param.Length == 0)
                 {
                     host = "";
                 }
                 ext_buf.AddRange(sni(host));
-                string str_buf2 = "00170000002300d0";
+                string str_buf2 = "001700000023";
                 ext_buf.AddRange(to_bin(str_buf2));
-                byte[] ticket = new byte[208];
-                g_random.GetBytes(ticket);
-                ext_buf.AddRange(ticket);
+                {
+                    TlsAuthData authData = (TlsAuthData)this.Server.data;
+                    byte[] ticket = null;
+                    lock (authData)
+                    {
+                        if (authData.ticket_buf == null)
+                        {
+                            authData.ticket_buf = new Dictionary<string, byte[]>();
+                        }
+                        if (!authData.ticket_buf.ContainsKey(host) || random.Next(16) == 0)
+                        {
+                            int ticket_size = random.Next(32, 196) * 2;
+                            ticket = new byte[ticket_size];
+                            g_random.GetBytes(ticket);
+                            authData.ticket_buf[host] = ticket;
+                        }
+                        else
+                        {
+                            ticket = authData.ticket_buf[host];
+                        }
+                    }
+                    ext_buf.Add((byte)(ticket.Length >> 8));
+                    ext_buf.Add((byte)(ticket.Length & 0xff));
+                    ext_buf.AddRange(ticket);
+                }
                 string str_buf3 = "000d0016001406010603050105030401040303010303020102030005000501000000000012000075500000000b00020100000a0006000400170018";
                 str_buf3 += "00150066000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
                 ext_buf.AddRange(to_bin(str_buf3));
@@ -536,15 +578,6 @@ namespace Shadowsocks.Obfs
                 }
                 outlength = ssl_buf.Count;
 
-                byte[] data = new byte[datalength + 5];
-                data[0] = 0x17;
-                data[1] = 0x3;
-                data[2] = 0x3;
-                data[3] = (byte)(datalength >> 8);
-                data[4] = (byte)(datalength);
-                Array.Copy(encryptdata, 0, data, 5, datalength);
-                data_sent_buffer.Add(data);
-
                 handshake_status = 1;
             }
             return outdata;
@@ -558,7 +591,7 @@ namespace Shadowsocks.Obfs
                 needsendback = false;
                 return encryptdata;
             }
-            else if (handshake_status == 8)
+            else if ((handshake_status & 8) == 8)
             {
                 Array.Resize(ref data_recv_buffer, data_recv_buffer.Length + datalength);
                 Array.Copy(encryptdata, 0, data_recv_buffer, data_recv_buffer.Length - datalength, datalength);
@@ -583,26 +616,60 @@ namespace Shadowsocks.Obfs
             }
             else
             {
-                byte[] outdata = new byte[datalength];
-                if (datalength < 11 + 32 + 1 + 32)
+                Array.Resize(ref data_recv_buffer, data_recv_buffer.Length + datalength);
+                Array.Copy(encryptdata, 0, data_recv_buffer, data_recv_buffer.Length - datalength, datalength);
+                outlength = 0;
+                needsendback = false;
+                byte[] outdata = new byte[data_recv_buffer.Length];
+                if (data_recv_buffer.Length >= 11 + 32 + 1 + 32)
                 {
-                    throw new ObfsException("ClientDecode data error");
-                }
-                else
-                {
-                    byte[] hmacsha1 = new byte[10];
                     byte[] data = new byte[32];
-                    Array.Copy(encryptdata, 11, data, 0, 22);
+                    Array.Copy(data_recv_buffer, 11, data, 0, 22);
                     hmac_sha1(data, data.Length);
-                    Array.Copy(data, 22, hmacsha1, 0, 10);
 
-                    if (Util.Utils.FindStr(encryptdata, 11 + 32 + 1 + 32, hmacsha1) != 11 + 22)
+                    if (!Util.Utils.BitCompare(data_recv_buffer, 11 + 22, data, 22, 10))
                     {
                         throw new ObfsException("ClientDecode data error: wrong sha1");
                     }
+
+                    int headerlength = data_recv_buffer.Length;
+                    data = new byte[headerlength];
+                    Array.Copy(data_recv_buffer, 0, data, 0, headerlength - 10);
+                    hmac_sha1(data, headerlength);
+                    if (!Util.Utils.BitCompare(data_recv_buffer, headerlength - 10, data, headerlength - 10, 10))
+                    {
+                        headerlength = 0;
+                        while (headerlength < data_recv_buffer.Length &&
+                            (data_recv_buffer[headerlength] == 0x14 || data_recv_buffer[headerlength] == 0x16))
+                        {
+                            headerlength += 5;
+                            if (headerlength >= data_recv_buffer.Length)
+                            {
+                                return encryptdata;
+                            }
+                            headerlength += (data_recv_buffer[headerlength - 2] << 8) | data_recv_buffer[headerlength - 1];
+                            if (headerlength > data_recv_buffer.Length)
+                            {
+                                return encryptdata;
+                            }
+                        }
+                        data = new byte[headerlength];
+                        Array.Copy(data_recv_buffer, 0, data, 0, headerlength - 10);
+                        hmac_sha1(data, headerlength);
+
+                        if (!Util.Utils.BitCompare(data_recv_buffer, headerlength - 10, data, headerlength - 10, 10))
+                        {
+                            throw new ObfsException("ClientDecode data error: wrong sha1");
+                        }
+                    }
+                    byte[] buffer = new byte[data_recv_buffer.Length - headerlength];
+                    Array.Copy(data_recv_buffer, headerlength, buffer, 0, buffer.Length);
+                    data_recv_buffer = buffer;
+                    handshake_status |= 8;
+                    byte[] ret = ClientDecode(encryptdata, 0, out outlength, out needsendback);
+                    needsendback = true;
+                    return ret;
                 }
-                outlength = 0;
-                needsendback = true;
                 return encryptdata;
             }
         }

@@ -24,7 +24,7 @@ namespace Shadowsocks.Controller
 
         public bool Handle(byte[] firstPacket, int length, Socket socket)
         {
-            return false;
+            return Handle(firstPacket, length, socket, null);
         }
 
         public bool Handle(byte[] firstPacket, int length, Socket socket, string local_sendback_protocol)
@@ -47,7 +47,7 @@ namespace Shadowsocks.Controller
 
         public int IsHandle(byte[] firstPacket, int length, Socket socket)
         {
-            if (length >= 7)
+            if (length >= 7 && _config.proxyRuleMode != (int)ProxyRuleMode.Disable)
             {
                 IPAddress ipAddress = null;
                 if (firstPacket[0] == 1)
@@ -70,20 +70,69 @@ namespace Shadowsocks.Controller
                         }
                         else
                         {
-                            if (_config.proxyRuleMode != 0
-                                && host.ToLower() == "localhost") //TODO: load system host file
+                            if (host.ToLower() == "localhost") //TODO: load system host file
                             {
                                 return 1;
                             }
-                            if (_config.proxyRuleMode == 2 && _IPRange != null)
+                            if ((_config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndChina || _config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndNotChina) && _IPRange != null)
                             {
-                                ipAddress = Utils.DnsBuffer.Get(host);
+                                if (!IPAddress.TryParse(host, out ipAddress))
+                                {
+                                    Shadowsocks.Model.HostMap hostMap = HostMap.Instance();
+                                    string host_addr;
+                                    if (hostMap.GetHost(host, out host_addr))
+                                    {
+                                        if (!String.IsNullOrEmpty(host_addr))
+                                        {
+                                            string lower_host_addr = host_addr.ToLower();
+                                            if (lower_host_addr.StartsWith("reject")
+                                                || lower_host_addr.StartsWith("direct")
+                                                )
+                                            {
+                                                return 1;
+                                            }
+                                            else if (lower_host_addr.StartsWith("localproxy"))
+                                            {
+                                                return 2;
+                                            }
+                                            else if (lower_host_addr.IndexOf('.') >= 0 || lower_host_addr.IndexOf(':') >= 0)
+                                            {
+                                                if (!IPAddress.TryParse(lower_host_addr, out ipAddress))
+                                                {
+                                                    //
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (ipAddress == null)
+                                    {
+                                        ipAddress = Utils.DnsBuffer.Get(host);
+                                    }
+                                }
                                 if (ipAddress == null)
                                 {
-                                    ipAddress = Util.Utils.QueryDns(host, _config.dns_server);
+                                    if (host.IndexOf('.') >= 0)
+                                    {
+                                        ipAddress = Util.Utils.QueryDns(host, _config.dns_server);
+                                    }
+                                    else
+                                    {
+                                        ipAddress = Utils.QueryDns(host, null);
+                                    }
                                     if (ipAddress != null)
                                     {
-                                        Utils.DnsBuffer.Set(host, ipAddress);
+                                        Utils.DnsBuffer.Set(host, new IPAddress(ipAddress.GetAddressBytes()));
+                                        if (host.IndexOf('.') >= 0)
+                                        {
+                                            if (Util.Utils.isLAN(ipAddress)) // assume that it is polution if return LAN address
+                                            {
+                                                return 0;
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Logging.Log(LogLevel.Debug, "DNS query fail: " + host);
                                     }
                                 }
                             }
@@ -98,12 +147,11 @@ namespace Shadowsocks.Controller
                 }
                 if (ipAddress != null)
                 {
-                    if (_config.proxyRuleMode != 0
-                        && Util.Utils.isLAN(ipAddress))
+                    if (Util.Utils.isLAN(ipAddress))
                     {
                         return 1;
                     }
-                    if (_config.proxyRuleMode == 2 && _IPRange != null
+                    if ((_config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndChina || _config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndNotChina) && _IPRange != null
                         && ipAddress.AddressFamily == AddressFamily.InterNetwork
                         )
                     {
@@ -119,6 +167,7 @@ namespace Shadowsocks.Controller
         }
 
         class Handler
+            : IHandler
         {
             private IPRangeSet _IPRange;
             private Configuration _config;
@@ -133,11 +182,12 @@ namespace Shadowsocks.Controller
             private string _remote_host;
             private int _remote_port;
 
-            public const int RecvSize = 4096;
+            public const int RecvSize = 1460 * 8;
             // remote receive buffer
             private byte[] remoteRecvBuffer = new byte[RecvSize];
             // connection receive buffer
             private byte[] connetionRecvBuffer = new byte[RecvSize];
+            private int _totalRecvSize = 0;
 
             protected int TTL = 600;
             protected System.Timers.Timer timer;
@@ -170,7 +220,7 @@ namespace Shadowsocks.Controller
                             ipAddress = new IPAddress(addr);
                             _targetPort = (_firstPacket[5] << 8) | _firstPacket[6];
                             _remote_host = ipAddress.ToString();
-                            Logging.Debug("Direct connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
                         }
                         else if (_firstPacket[0] == 4)
                         {
@@ -179,7 +229,7 @@ namespace Shadowsocks.Controller
                             ipAddress = new IPAddress(addr);
                             _targetPort = (_firstPacket[17] << 8) | _firstPacket[18];
                             _remote_host = ipAddress.ToString();
-                            Logging.Debug("Direct connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
                         }
                         else if (_firstPacket[0] == 3)
                         {
@@ -188,21 +238,52 @@ namespace Shadowsocks.Controller
                             Array.Copy(_firstPacket, 2, addr, 0, addr.Length);
                             _remote_host = Encoding.UTF8.GetString(_firstPacket, 2, len);
                             _targetPort = (_firstPacket[len + 2] << 8) | _firstPacket[len + 3];
-                            Logging.Debug("Direct connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
 
                             if (!_remote_go_proxy)
                             {
                                 if (!IPAddress.TryParse(_remote_host, out ipAddress))
                                 {
-                                    ipAddress = Utils.DnsBuffer.Get(_remote_host);
+                                    Shadowsocks.Model.HostMap hostMap = HostMap.Instance();
+                                    string host_addr;
+                                    if (hostMap.GetHost(_remote_host, out host_addr))
+                                    {
+                                        if (!String.IsNullOrEmpty(host_addr))
+                                        {
+                                            string lower_host_addr = host_addr.ToLower();
+                                            if (lower_host_addr.StartsWith("reject"))
+                                            {
+                                                Close();
+                                                return;
+                                            }
+                                            else if (lower_host_addr.IndexOf('.') >= 0 || lower_host_addr.IndexOf(':') >= 0)
+                                            {
+                                                if (!IPAddress.TryParse(lower_host_addr, out ipAddress))
+                                                {
+                                                    //
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (ipAddress == null)
+                                    {
+                                        ipAddress = Utils.DnsBuffer.Get(_remote_host);
+                                    }
                                 }
                                 if (ipAddress == null)
                                 {
-                                    ipAddress = Utils.QueryDns(_remote_host, _config.dns_server);
+                                    if (_remote_host.IndexOf('.') >= 0)
+                                    {
+                                        ipAddress = Util.Utils.QueryDns(_remote_host, _config.dns_server);
+                                    }
+                                    else
+                                    {
+                                        ipAddress = Utils.QueryDns(_remote_host, null);
+                                    }
                                 }
                                 if (ipAddress != null)
                                 {
-                                    Utils.DnsBuffer.Set(_remote_host, ipAddress);
+                                    Utils.DnsBuffer.Set(_remote_host, new IPAddress(ipAddress.GetAddressBytes()));
                                     Utils.DnsBuffer.Sweep();
                                 }
                                 else
@@ -223,7 +304,7 @@ namespace Shadowsocks.Controller
 
                     _remote = new ProxySocketTun(ipAddress.AddressFamily,
                         SocketType.Stream, ProtocolType.Tcp);
-                    _remote.GetSocket().SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                    _remote.GetSocket().NoDelay = true;
 
                     // Connect to the remote endpoint.
                     _remote.BeginConnect(remoteEP,
@@ -340,6 +421,7 @@ namespace Shadowsocks.Controller
                 }
                 try
                 {
+                    Server.GetForwardServerRef().GetConnections().AddRef(this);
                     _remote.BeginReceive(remoteRecvBuffer, RecvSize, 0,
                         new AsyncCallback(PipeRemoteReceiveCallback), null);
                     _local.BeginReceive(connetionRecvBuffer, RecvSize, 0,
@@ -370,8 +452,14 @@ namespace Shadowsocks.Controller
                         ResetTimeout(TTL);
                         //_local.BeginSend(remoteRecvBuffer, bytesRead, 0, new AsyncCallback(PipeConnectionSendCallback), null);
                         _local.Send(remoteRecvBuffer, bytesRead, 0);
-                        _remote.BeginReceive(remoteRecvBuffer, RecvSize, 0,
-                            new AsyncCallback(PipeRemoteReceiveCallback), null);
+                        _totalRecvSize += bytesRead;
+                        if (_totalRecvSize <= 1024 * 1024 * 2)
+                        {
+                            _remote.BeginReceive(remoteRecvBuffer, RecvSize, 0,
+                                new AsyncCallback(PipeRemoteReceiveCallback), null);
+                        }
+                        else
+                            PipeRemoteReceiveLoop();
                     }
                     else
                     {
@@ -383,6 +471,60 @@ namespace Shadowsocks.Controller
                     Logging.LogUsefulException(e);
                     Close();
                 }
+            }
+
+            private void PipeRemoteReceiveLoop()
+            {
+                bool final_close = false;
+                byte[] recv_buffer = new byte[RecvSize];
+                DateTime beforeReceive = DateTime.Now;
+                while (!_closed)
+                {
+                    try
+                    {
+                        int bytesRead = _remote.Receive(recv_buffer, RecvSize, 0);
+                        DateTime now = DateTime.Now;
+                        if (_remote != null && _remote.IsClose)
+                        {
+                            final_close = true;
+                            break;
+                        }
+                        if (_closed)
+                        {
+                            break;
+                        }
+                        ResetTimeout(TTL);
+
+                        if (bytesRead > 0)
+                        {
+                            _local.Send(recv_buffer, bytesRead, 0);
+
+                            if ((now - beforeReceive).TotalSeconds > 5)
+                            {
+                                _totalRecvSize = 0;
+                                _remote.BeginReceive(remoteRecvBuffer, RecvSize, 0,
+                                    new AsyncCallback(PipeRemoteReceiveCallback), null);
+                                return;
+                            }
+                            else
+                            {
+                                beforeReceive = now;
+                            }
+                        }
+                        else
+                        {
+                            Close();
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Logging.LogUsefulException(e);
+                        final_close = true;
+                        break;
+                    }
+                }
+                if (final_close)
+                    Close();
             }
 
             private void PipeConnectionReceiveCallback(IAsyncResult ar)
@@ -415,41 +557,24 @@ namespace Shadowsocks.Controller
                 }
             }
 
-            private void PipeRemoteSendCallback(IAsyncResult ar)
+            private void CloseSocket(ProxySocketTun sock)
             {
-                if (_closed)
+                lock (this)
                 {
-                    return;
-                }
-                try
-                {
-                    _remote.EndSend(ar);
-                    _local.BeginReceive(connetionRecvBuffer, RecvSize, 0,
-                        new AsyncCallback(PipeConnectionReceiveCallback), null);
-                }
-                catch (Exception e)
-                {
-                    Logging.LogUsefulException(e);
-                    Close();
-                }
-            }
-
-            private void PipeConnectionSendCallback(IAsyncResult ar)
-            {
-                if (_closed)
-                {
-                    return;
-                }
-                try
-                {
-                    _local.EndSend(ar);
-                    _remote.BeginReceive(remoteRecvBuffer, RecvSize, 0,
-                        new AsyncCallback(PipeRemoteReceiveCallback), null);
-                }
-                catch (Exception e)
-                {
-                    Logging.LogUsefulException(e);
-                    Close();
+                    if (sock != null)
+                    {
+                        ProxySocketTun s = sock;
+                        try
+                        {
+                            s.Shutdown(SocketShutdown.Both);
+                        }
+                        catch { }
+                        try
+                        {
+                            s.Close();
+                        }
+                        catch { }
+                    }
                 }
             }
 
@@ -465,30 +590,15 @@ namespace Shadowsocks.Controller
                 }
                 ResetTimeout(0);
                 Thread.Sleep(100);
-                if (_remote != null)
-                {
-                    try
-                    {
-                        _remote.Shutdown(SocketShutdown.Both);
-                        _remote.Close();
-                    }
-                    catch (SocketException e)
-                    {
-                        Logging.LogUsefulException(e);
-                    }
-                }
-                if (_local != null)
-                {
-                    try
-                    {
-                        _local.Shutdown(SocketShutdown.Both);
-                        _local.Close();
-                    }
-                    catch (Exception e)
-                    {
-                        Logging.LogUsefulException(e);
-                    }
-                }
+                CloseSocket(_remote);
+                CloseSocket(_local);
+                Server.GetForwardServerRef().GetConnections().DecRef(this);
+            }
+
+            public override void Shutdown()
+            {
+                InvokeHandler handler = () => Close();
+                handler.BeginInvoke(null, null);
             }
         }
     }
