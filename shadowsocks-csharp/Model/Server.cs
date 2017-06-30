@@ -136,6 +136,12 @@ namespace Shadowsocks.Model
             enable = Server.enable;
         }
 
+        public void CopyServerInfo(Server Server)
+        {
+            remarks = Server.remarks;
+            group = Server.group;
+        }
+
         public static Server GetForwardServerRef()
         {
             return forwardServer;
@@ -299,7 +305,7 @@ namespace Shadowsocks.Model
 
         public Server()
         {
-            server = "server ip or url";
+            server = "server host";
             server_port = 8388;
             method = "aes-256-cfb";
             protocol = "origin";
@@ -308,7 +314,7 @@ namespace Shadowsocks.Model
             obfsparam = "";
             password = "0";
             remarks_base64 = "";
-            group = "";
+            group = "FreeSSR-public";
             udp_over_tcp = false;
             enable = true;
             byte[] id = new byte[16];
@@ -430,6 +436,8 @@ namespace Shadowsocks.Model
             {
                 group = Util.Base64.DecodeStandardSSRUrlSafeBase64(params_dict["group"]);
             }
+            else
+                group = "";
             if (params_dict.ContainsKey("uot"))
             {
                 udp_over_tcp = int.Parse(params_dict["uot"]) != 0;
@@ -462,6 +470,8 @@ namespace Shadowsocks.Model
             server_port = int.Parse(match.Groups["port"].Value);
             if (!String.IsNullOrEmpty(force_group))
                 group = force_group;
+            else
+                group = "";
         }
 
         public string GetSSLinkForServer()

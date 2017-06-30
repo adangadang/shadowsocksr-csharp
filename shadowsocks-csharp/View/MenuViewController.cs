@@ -27,6 +27,7 @@ namespace Shadowsocks.View
         private ShadowsocksController controller;
         private UpdateChecker updateChecker;
         private UpdateFreeNode updateFreeNodeChecker;
+        private UpdateSubscribeManager updateSubscribeManager;
 
         private NotifyIcon _notifyIcon;
         private ContextMenu contextMenu1;
@@ -40,6 +41,7 @@ namespace Shadowsocks.View
         private MenuItem ruleBypassLan;
         private MenuItem ruleBypassChina;
         private MenuItem ruleBypassNotChina;
+        private MenuItem ruleUser;
         private MenuItem ruleDisableBypass;
 
         private MenuItem SeperatorItem;
@@ -85,12 +87,14 @@ namespace Shadowsocks.View
             updateFreeNodeChecker = new UpdateFreeNode();
             updateFreeNodeChecker.NewFreeNodeFound += updateFreeNodeChecker_NewFreeNodeFound;
 
+            updateSubscribeManager = new UpdateSubscribeManager();
+
             LoadCurrentConfiguration();
 
             Configuration cfg = controller.GetCurrentConfiguration();
             if (cfg.isDefaultConfig() || cfg.nodeFeedAutoUpdate)
             {
-                updateFreeNodeChecker.CheckUpdate(controller.GetCurrentConfiguration(), !cfg.isDefaultConfig());
+                updateSubscribeManager.CreateTask(controller.GetCurrentConfiguration(), updateFreeNodeChecker, -1, !cfg.isDefaultConfig());
             }
 
             timerDelayCheckUpdate = new System.Timers.Timer(1000.0 * 10);
@@ -231,6 +235,7 @@ namespace Shadowsocks.View
                     ruleBypassLan = CreateMenuItem("Bypass LAN", new EventHandler(this.RuleBypassLanItem_Click)),
                     ruleBypassChina = CreateMenuItem("Bypass LAN && China", new EventHandler(this.RuleBypassChinaItem_Click)),
                     ruleBypassNotChina = CreateMenuItem("Bypass LAN && not China", new EventHandler(this.RuleBypassNotChinaItem_Click)),
+                    ruleUser = CreateMenuItem("User custom", new EventHandler(this.RuleUserItem_Click)),
                     new MenuItem("-"),
                     ruleDisableBypass = CreateMenuItem("Disable bypass", new EventHandler(this.RuleBypassDisableItem_Click)),
                 }),
@@ -326,6 +331,7 @@ namespace Shadowsocks.View
 
         void updateFreeNodeChecker_NewFreeNodeFound(object sender, EventArgs e)
         {
+            int count = 0;
             if (!String.IsNullOrEmpty(updateFreeNodeChecker.FreeNodeResult))
             {
                 List<string> urls = new List<string>();
@@ -359,7 +365,6 @@ namespace Shadowsocks.View
                     }
                 }
                 URL_Split(updateFreeNodeChecker.FreeNodeResult, ref urls);
-                int count = 0;
                 for (int i = urls.Count - 1; i >= 0; --i)
                 {
                     if (!urls[i].StartsWith("ssr"))
@@ -377,8 +382,11 @@ namespace Shadowsocks.View
                         Random r = new Random();
                         Util.Utils.Shuffle(urls, r);
                         urls.RemoveRange(max_node_num, urls.Count - max_node_num);
-                        keep_selected_server = true;
+                        if (!config.isDefaultConfig())
+                            keep_selected_server = true;
                     }
+                    string lastGroup = null;
+                    string curGroup = null;
                     foreach (string url in urls)
                     {
                         try // try get group name
@@ -386,19 +394,33 @@ namespace Shadowsocks.View
                             Server server = new Server(url, null);
                             if (!String.IsNullOrEmpty(server.group))
                             {
-                                config.nodeFeedGroup = server.group;
+                                curGroup = server.group;
                                 break;
                             }
                         }
                         catch
                         { }
                     }
-                    if (String.IsNullOrEmpty(config.nodeFeedGroup))
+                    string subscribeURL = updateSubscribeManager.URL;
+                    if (String.IsNullOrEmpty(curGroup))
                     {
-                        config.nodeFeedGroup = config.nodeFeedURL;
+                        curGroup = subscribeURL;
+                    }
+                    for (int i = 0; i < config.serverSubscribes.Count; ++i)
+                    {
+                        if (subscribeURL == config.serverSubscribes[i].URL)
+                        {
+                            lastGroup = config.serverSubscribes[i].Group;
+                            config.serverSubscribes[i].Group = curGroup;
+                            break;
+                        }
+                    }
+                    if (lastGroup == null)
+                    {
+                        lastGroup = curGroup;
                     }
 
-                    if (keep_selected_server && selected_server.group == config.nodeFeedGroup)
+                    if (keep_selected_server && selected_server.group == curGroup)
                     {
                         bool match = false;
                         for (int i = 0; i < urls.Count; ++i)
@@ -425,18 +447,21 @@ namespace Shadowsocks.View
                     // import all, find difference
                     {
                         Dictionary<string, Server> old_servers = new Dictionary<string, Server>();
-                        for (int i = config.configs.Count - 1; i >= 0; --i)
+                        if (!String.IsNullOrEmpty(lastGroup))
                         {
-                            if (config.nodeFeedGroup == config.configs[i].group)
+                            for (int i = config.configs.Count - 1; i >= 0; --i)
                             {
-                                old_servers[config.configs[i].id] = config.configs[i];
+                                if (lastGroup == config.configs[i].group)
+                                {
+                                    old_servers[config.configs[i].id] = config.configs[i];
+                                }
                             }
                         }
                         foreach (string url in urls)
                         {
                             try
                             {
-                                Server server = new Server(url, config.nodeFeedGroup);
+                                Server server = new Server(url, curGroup);
                                 bool match = false;
                                 foreach (KeyValuePair<string, Server> pair in old_servers)
                                 {
@@ -444,6 +469,7 @@ namespace Shadowsocks.View
                                     {
                                         match = true;
                                         old_servers.Remove(pair.Key);
+                                        pair.Value.CopyServerInfo(server);
                                         ++count;
                                         break;
                                     }
@@ -503,16 +529,22 @@ namespace Shadowsocks.View
                     }
                     controller.SaveServersConfig(config);
 
-                    if (count > 0)
-                    {
-                        ShowBalloonTip(I18N.GetString("Success"),
-                            I18N.GetString("Update subscribe SSR node success"), ToolTipIcon.Info, 10000);
-                        return;
-                    }
                 }
             }
-            ShowBalloonTip(I18N.GetString("Error"),
-                I18N.GetString("Update subscribe SSR node failure"), ToolTipIcon.Info, 10000);
+            if (count > 0)
+            {
+                ShowBalloonTip(I18N.GetString("Success"),
+                    I18N.GetString("Update subscribe SSR node success"), ToolTipIcon.Info, 10000);
+            }
+            else
+            {
+                ShowBalloonTip(I18N.GetString("Error"),
+                    I18N.GetString("Update subscribe SSR node failure"), ToolTipIcon.Info, 10000);
+            }
+            if (updateSubscribeManager.Next())
+            {
+
+            }
         }
 
         void updateChecker_NewVersionFound(object sender, EventArgs e)
@@ -563,6 +595,7 @@ namespace Shadowsocks.View
             ruleBypassLan.Checked = config.proxyRuleMode == (int)ProxyRuleMode.BypassLan;
             ruleBypassChina.Checked = config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndChina;
             ruleBypassNotChina.Checked = config.proxyRuleMode == (int)ProxyRuleMode.BypassLanAndNotChina;
+            ruleUser.Checked = config.proxyRuleMode == (int)ProxyRuleMode.UserCustom;
         }
 
         private void LoadCurrentConfiguration()
@@ -952,22 +985,27 @@ namespace Shadowsocks.View
 
         private void RuleBypassLanItem_Click(object sender, EventArgs e)
         {
-            controller.ToggleRuleMode(1);
+            controller.ToggleRuleMode((int)ProxyRuleMode.BypassLan);
         }
 
         private void RuleBypassChinaItem_Click(object sender, EventArgs e)
         {
-            controller.ToggleRuleMode(2);
+            controller.ToggleRuleMode((int)ProxyRuleMode.BypassLanAndChina);
         }
 
         private void RuleBypassNotChinaItem_Click(object sender, EventArgs e)
         {
-            controller.ToggleRuleMode(3);
+            controller.ToggleRuleMode((int)ProxyRuleMode.BypassLanAndNotChina);
+        }
+
+        private void RuleUserItem_Click(object sender, EventArgs e)
+        {
+            controller.ToggleRuleMode((int)ProxyRuleMode.UserCustom);
         }
 
         private void RuleBypassDisableItem_Click(object sender, EventArgs e)
         {
-            controller.ToggleRuleMode(0);
+            controller.ToggleRuleMode((int)ProxyRuleMode.Disable);
         }
 
         private void SelectRandomItem_Click(object sender, EventArgs e)
@@ -1045,12 +1083,12 @@ namespace Shadowsocks.View
 
         private void CheckNodeUpdate_Click(object sender, EventArgs e)
         {
-            updateFreeNodeChecker.CheckUpdate(controller.GetCurrentConfiguration(), true);
+            updateSubscribeManager.CreateTask(controller.GetCurrentConfiguration(), updateFreeNodeChecker, -1, true);
         }
 
         private void CheckNodeUpdateBypassProxy_Click(object sender, EventArgs e)
         {
-            updateFreeNodeChecker.CheckUpdate(controller.GetCurrentConfiguration(), false);
+            updateSubscribeManager.CreateTask(controller.GetCurrentConfiguration(), updateFreeNodeChecker, -1, false);
         }
 
         private void ShowLogItem_Click(object sender, EventArgs e)
