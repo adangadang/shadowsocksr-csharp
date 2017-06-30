@@ -95,6 +95,10 @@ namespace Shadowsocks.Controller
                                             {
                                                 return 2;
                                             }
+                                            else if (lower_host_addr.StartsWith("remoteproxy"))
+                                            {
+                                                return 0;
+                                            }
                                             else if (lower_host_addr.IndexOf('.') >= 0 || lower_host_addr.IndexOf(':') >= 0)
                                             {
                                                 if (!IPAddress.TryParse(lower_host_addr, out ipAddress))
@@ -220,7 +224,7 @@ namespace Shadowsocks.Controller
                             ipAddress = new IPAddress(addr);
                             _targetPort = (_firstPacket[5] << 8) | _firstPacket[6];
                             _remote_host = ipAddress.ToString();
-                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Info((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
                         }
                         else if (_firstPacket[0] == 4)
                         {
@@ -229,7 +233,7 @@ namespace Shadowsocks.Controller
                             ipAddress = new IPAddress(addr);
                             _targetPort = (_firstPacket[17] << 8) | _firstPacket[18];
                             _remote_host = ipAddress.ToString();
-                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Info((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
                         }
                         else if (_firstPacket[0] == 3)
                         {
@@ -238,7 +242,7 @@ namespace Shadowsocks.Controller
                             Array.Copy(_firstPacket, 2, addr, 0, addr.Length);
                             _remote_host = Encoding.UTF8.GetString(_firstPacket, 2, len);
                             _targetPort = (_firstPacket[len + 2] << 8) | _firstPacket[len + 3];
-                            Logging.Debug((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
+                            Logging.Info((_remote_go_proxy ? "Local proxy" : "Direct") + " connect " + _remote_host + ":" + _targetPort.ToString());
 
                             if (!_remote_go_proxy)
                             {
